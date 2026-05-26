@@ -1,0 +1,18 @@
+[Unit]
+Description=Orbyn Lead Qualification Telegram Bot
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/agente-cualificacion-leads
+EnvironmentFile=/home/ubuntu/agente-cualificacion-leads/.env
+ExecStart=/home/ubuntu/agente-cualificacion-leads/venv/bin/python main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
