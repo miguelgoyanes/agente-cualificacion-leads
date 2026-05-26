@@ -10,7 +10,8 @@ ICP (Ideal Customer Profile) de Orbyn:
 
 import json
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 from groq import Groq
 
@@ -21,15 +22,20 @@ logger = logging.getLogger(__name__)
 # Cliente Groq — inicializado una sola vez al importar el módulo
 _client = Groq(api_key=GROQ_API_KEY)
 
+# Configuración de reintentos
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 2  # segundos — backoff exponencial: 2s, 4s, 8s
+
 
 @dataclass
 class QualificationResult:
     """Resultado estructurado de la cualificación de un lead."""
     qualified: bool
-    decision: str          # "CUALIFICADO" | "NO CUALIFICADO"
+    decision: str          # "CUALIFICADO" | "NO CUALIFICADO" | "DATOS_INSUFICIENTES"
     reason: str            # 2-3 líneas de razonamiento
     criteria: dict         # {tipo_empresa, empleados_minimo, geografia, interes_automatizacion}
     raw_input: str         # Texto original del lead
+    missing: list = field(default_factory=list)  # Campos ausentes (solo en DATOS_INSUFICIENTES)
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -46,6 +52,9 @@ ICP DE ORBYN:
 3. GEOGRAFÍA: Debe estar en España o en Latinoamérica (LATAM). No cualificar empresas de EE.UU., Europa fuera de España, Asia, etc.
 4. INTERÉS: Debe mostrar interés explícito o implícito en automatización de procesos, inteligencia artificial, o digitalización de operaciones.
 
+CASO ESPECIAL — DATOS INSUFICIENTES:
+Si el mensaje es tan escaso que no puedes evaluar 2 o más criterios (por ejemplo "empresa en Madrid" sin más información), responde con decision "DATOS_INSUFICIENTES" e indica qué datos concretos faltan.
+
 INSTRUCCIONES:
 - Analiza el texto del lead de forma objetiva y extrae la información disponible.
 - Si un criterio no puede determinarse por falta de información, márcalo como false.
@@ -53,16 +62,31 @@ INSTRUCCIONES:
 - El motivo debe ser concreto y específico, no genérico. Menciona los datos reales del lead.
 - Responde ÚNICAMENTE con un JSON válido, sin texto adicional, sin markdown, sin explicaciones fuera del JSON.
 
-FORMATO DE RESPUESTA (JSON estricto):
+FORMATO DE RESPUESTA — Lead evaluable:
 {
   "qualified": true o false,
   "decision": "CUALIFICADO" o "NO CUALIFICADO",
   "reason": "2-3 líneas explicando el razonamiento con datos concretos del lead",
+  "missing": [],
   "criteria": {
     "tipo_empresa": true o false,
     "empleados_minimo": true o false,
     "geografia": true o false,
     "interes_automatizacion": true o false
+  }
+}
+
+FORMATO DE RESPUESTA — Datos insuficientes:
+{
+  "qualified": false,
+  "decision": "DATOS_INSUFICIENTES",
+  "reason": "Explica qué información falta y por qué es necesaria para evaluar el lead",
+  "missing": ["tipo de empresa", "número de empleados"],
+  "criteria": {
+    "tipo_empresa": false,
+    "empleados_minimo": false,
+    "geografia": false,
+    "interes_automatizacion": false
   }
 }"""
 
@@ -70,6 +94,7 @@ FORMATO DE RESPUESTA (JSON estricto):
 def qualify_lead(lead_text: str) -> QualificationResult:
     """
     Envía el texto del lead a Groq (Llama) y devuelve un QualificationResult.
+    Reintenta automáticamente hasta MAX_RETRIES veces con backoff exponencial.
 
     Args:
         lead_text: Texto libre con los datos del lead recibido por Telegram.
@@ -79,7 +104,7 @@ def qualify_lead(lead_text: str) -> QualificationResult:
 
     Raises:
         ValueError: Si la respuesta no puede parsearse como JSON válido.
-        Exception: Errores de red o de cuota de la API.
+        Exception: Si todos los reintentos fallan.
     """
     logger.info("Cualificando lead: %s", lead_text[:100])
 
@@ -90,29 +115,52 @@ def qualify_lead(lead_text: str) -> QualificationResult:
 {lead_text}
 </lead_data>"""
 
-    response = _client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
-        temperature=0.1,        # Baja temperatura = respuestas más consistentes
-        max_tokens=512,
-        response_format={"type": "json_object"},  # Fuerza JSON válido siempre
-    )
+    last_error = None
 
-    raw_response = response.choices[0].message.content.strip()
-    logger.debug("Respuesta Groq: %s", raw_response)
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = _client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=0.1,
+                max_tokens=512,
+                response_format={"type": "json_object"},
+            )
 
-    parsed = _parse_json_response(raw_response)
+            raw_response = response.choices[0].message.content.strip()
+            logger.debug("Respuesta Groq (intento %d): %s", attempt, raw_response)
 
-    return QualificationResult(
-        qualified=parsed["qualified"],
-        decision=parsed["decision"],
-        reason=parsed["reason"],
-        criteria=parsed["criteria"],
-        raw_input=lead_text,
-    )
+            parsed = _parse_json_response(raw_response)
+
+            return QualificationResult(
+                qualified=parsed["qualified"],
+                decision=parsed["decision"],
+                reason=parsed["reason"],
+                criteria=parsed["criteria"],
+                raw_input=lead_text,
+                missing=parsed.get("missing", []),
+            )
+
+        except ValueError:
+            # Error de parsing — no tiene sentido reintentar
+            raise
+
+        except Exception as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                delay = RETRY_BASE_DELAY * attempt  # 2s, 4s, 6s
+                logger.warning(
+                    "Intento %d/%d fallido, reintentando en %ds: %s",
+                    attempt, MAX_RETRIES, delay, e,
+                )
+                time.sleep(delay)
+            else:
+                logger.error("Todos los reintentos agotados: %s", e)
+
+    raise last_error
 
 
 def _parse_json_response(text: str) -> dict:
@@ -126,7 +174,6 @@ def _parse_json_response(text: str) -> dict:
         logger.error("JSON inválido: %s\nTexto: %s", e, text)
         raise ValueError(f"Respuesta JSON inválida: {e}")
 
-    # Validar campos requeridos
     required_keys = {"qualified", "decision", "reason", "criteria"}
     missing = required_keys - set(data.keys())
     if missing:

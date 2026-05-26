@@ -5,10 +5,13 @@ bot/messages.py — Templates de mensajes para respuestas de Telegram.
 from services.qualifier import QualificationResult
 
 
-def format_qualification_response(result: QualificationResult) -> str:
+def format_qualification_response(result: QualificationResult, sheets_ok: bool | None = None) -> str:
     """
     Genera el mensaje de Telegram con la decisión de cualificación.
-    Usa Markdown (parse_mode='Markdown' en python-telegram-bot).
+
+    Args:
+        result: Resultado de la cualificación.
+        sheets_ok: True si el log a Sheets funcionó, False si falló, None si aún no se intentó.
     """
     c = result.criteria
 
@@ -27,11 +30,40 @@ def format_qualification_response(result: QualificationResult) -> str:
     else:
         header = "❌ *Lead NO CUALIFICADO*"
 
-    return (
+    msg = (
         f"{header}\n\n"
         f"{result.reason}\n\n"
         f"📊 {criteria_line}"
     )
+
+    if sheets_ok is True:
+        msg += "\n\n📋 _Guardado en registro_"
+    elif sheets_ok is False:
+        msg += "\n\n⚠️ _Error al guardar en registro_"
+
+    return msg
+
+
+def format_insufficient_data_response(result: QualificationResult, sheets_ok: bool | None = None) -> str:
+    """Mensaje cuando los datos del lead son insuficientes para evaluarlo."""
+    missing_str = ""
+    if result.missing:
+        items = "".join(f"\n  • {campo}" for campo in result.missing)
+        missing_str = f"\n\n*Información que falta:*{items}"
+
+    msg = (
+        f"❓ *Datos insuficientes*\n\n"
+        f"{result.reason}"
+        f"{missing_str}\n\n"
+        f"_Envía más información sobre el lead para poder evaluarlo._"
+    )
+
+    if sheets_ok is True:
+        msg += "\n\n📋 _Guardado en registro_"
+    elif sheets_ok is False:
+        msg += "\n\n⚠️ _Error al guardar en registro_"
+
+    return msg
 
 
 def format_error_response() -> str:
@@ -70,3 +102,5 @@ def format_help() -> str:
         "• _\"Startup de e-commerce en EE.UU.\"_\n\n"
         "El bot analizará los datos y te dirá si el lead está cualificado o no, con el razonamiento."
     )
+
+

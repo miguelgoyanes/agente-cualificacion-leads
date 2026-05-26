@@ -11,6 +11,7 @@ from telegram.ext import ContextTypes
 from bot.messages import (
     format_error_response,
     format_help,
+    format_insufficient_data_response,
     format_qualification_response,
     format_welcome,
 )
@@ -35,11 +36,11 @@ async def lead_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     Handler principal: recibe el texto del lead, lo cualifica y responde.
 
     Flujo:
-    1. Recibir mensaje de Telegram
-    2. Enviar "analizando..." para feedback inmediato
-    3. Llamar al qualifier (Gemini)
-    4. Responder con la decisión
-    5. Loguear en Google Sheets (no bloquea la respuesta si falla)
+    1. Recibir mensaje → mostrar "analizando..." inmediatamente
+    2. Llamar al qualifier (Groq) con reintentos automáticos
+    3. Editar el mensaje con la decisión
+    4. Loguear en Google Sheets
+    5. Editar el mensaje de nuevo añadiendo confirmación del log
     """
     user = update.effective_user
     chat_id = update.effective_chat.id
@@ -52,36 +53,46 @@ async def lead_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         lead_text[:80],
     )
 
-    # Feedback inmediato mientras Gemini procesa
+    # Feedback inmediato mientras Groq procesa
     thinking_msg = await update.message.reply_text(
         "🔍 _Analizando lead..._", parse_mode=ParseMode.MARKDOWN
     )
 
     try:
-        # ── 1. Cualificar con Gemini ───────────────────────────────────────────
+        # ── 1. Cualificar con Groq (con reintentos automáticos) ───────────────
         result = qualify_lead(lead_text)
 
-        # ── 2. Responder en Telegram ──────────────────────────────────────────
-        response_text = format_qualification_response(result)
+        # ── 2. Responder en Telegram (sin estado del log aún) ────────────────
+        if result.decision == "DATOS_INSUFICIENTES":
+            response_text = format_insufficient_data_response(result)
+        else:
+            response_text = format_qualification_response(result)
+
         await thinking_msg.edit_text(response_text, parse_mode=ParseMode.MARKDOWN)
 
         logger.info(
-            "Lead cualificado para @%s: %s",
+            "Lead evaluado para @%s: %s",
             user.username or user.first_name,
             result.decision,
         )
 
-        # ── 3. Loguear en Google Sheets (fallo silencioso) ────────────────────
+        # ── 4. Loguear en Google Sheets ───────────────────────────────────────
         telegram_username = f"@{user.username}" if user.username else user.first_name
-        log_lead(result, telegram_username=telegram_username, chat_id=str(chat_id))
+        sheets_ok = log_lead(result, telegram_username=telegram_username, chat_id=str(chat_id))
+
+        # ── 5. Editar mensaje añadiendo confirmación del log ──────────────────
+        if result.decision == "DATOS_INSUFICIENTES":
+            final_text = format_insufficient_data_response(result, sheets_ok=sheets_ok)
+        else:
+            final_text = format_qualification_response(result, sheets_ok=sheets_ok)
+
+        await thinking_msg.edit_text(final_text, parse_mode=ParseMode.MARKDOWN)
 
     except ValueError as e:
-        # Error de parsing de la respuesta de Gemini
-        logger.error("Error de cualificación (ValueError): %s", e)
+        logger.error("Error de parsing de respuesta LLM: %s", e)
         await thinking_msg.edit_text(format_error_response(), parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
-        # Error inesperado (red, cuota de API, etc.)
         logger.error("Error inesperado en lead_handler: %s", e, exc_info=True)
         await thinking_msg.edit_text(format_error_response(), parse_mode=ParseMode.MARKDOWN)
 

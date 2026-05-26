@@ -4,7 +4,7 @@ services/sheets.py — Logging de leads cualificados en Google Sheets.
 Columnas del spreadsheet:
   A: Fecha/Hora
   B: Datos Lead (texto recibido)
-  C: Decisión (CUALIFICADO / NO CUALIFICADO)
+  C: Decisión (CUALIFICADO / NO CUALIFICADO / DATOS_INSUFICIENTES)
   D: Motivo
   E: Tipo Empresa ✅/❌
   F: Empleados Mínimo ✅/❌
@@ -25,12 +25,8 @@ from services.qualifier import QualificationResult
 
 logger = logging.getLogger(__name__)
 
-# Scopes mínimos necesarios
-_SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-]
+_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Cabeceras de la hoja (se crean automáticamente si la hoja está vacía)
 _HEADERS = [
     "Fecha/Hora",
     "Datos Lead",
@@ -44,13 +40,11 @@ _HEADERS = [
     "Chat ID",
 ]
 
-# Cliente gspread — se inicializa de forma lazy (una sola vez)
 _client: gspread.Client | None = None
 _worksheet: gspread.Worksheet | None = None
 
 
 def _get_worksheet() -> gspread.Worksheet:
-    """Devuelve el worksheet cacheado, creando la conexión si no existe."""
     global _client, _worksheet
 
     if _worksheet is not None:
@@ -62,7 +56,6 @@ def _get_worksheet() -> gspread.Worksheet:
 
     spreadsheet = _client.open_by_key(GOOGLE_SHEET_ID)
 
-    # Obtener o crear la pestaña
     try:
         _worksheet = spreadsheet.worksheet(GOOGLE_SHEET_TAB)
         logger.info("Hoja '%s' encontrada.", GOOGLE_SHEET_TAB)
@@ -72,8 +65,7 @@ def _get_worksheet() -> gspread.Worksheet:
             title=GOOGLE_SHEET_TAB, rows=1000, cols=len(_HEADERS)
         )
 
-    # Añadir cabeceras si la hoja está vacía
-    if _worksheet.row_count == 0 or not _worksheet.row_values(1):
+    if not _worksheet.row_values(1):
         _worksheet.append_row(_HEADERS, value_input_option="USER_ENTERED")
         logger.info("Cabeceras creadas en la hoja.")
 
@@ -88,14 +80,12 @@ def log_lead(
     result: QualificationResult,
     telegram_username: str = "",
     chat_id: str = "",
-) -> None:
+) -> bool:
     """
-    Añade una fila con los datos del lead y la decisión al Google Sheet.
+    Añade una fila con los datos del lead en Google Sheets.
 
-    Args:
-        result: Resultado de la cualificación.
-        telegram_username: @username del usuario de Telegram (puede estar vacío).
-        chat_id: ID del chat de Telegram.
+    Returns:
+        True si el log se escribió correctamente, False si hubo algún error.
     """
     try:
         ws = _get_worksheet()
@@ -117,7 +107,8 @@ def log_lead(
 
         ws.append_row(row, value_input_option="USER_ENTERED")
         logger.info("Lead logueado en Google Sheets: %s", result.decision)
+        return True
 
     except Exception as e:
-        # El fallo del log NO debe interrumpir la respuesta al usuario
         logger.error("Error al loguear en Google Sheets: %s", e, exc_info=True)
+        return False
